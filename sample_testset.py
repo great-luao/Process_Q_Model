@@ -13,19 +13,15 @@ import pandas as pd
 from tqdm import tqdm
 from datasets import load_from_disk,load_dataset
 
-
-# from fastchat import conv_template
-
-
 def load_generator(checkpoint, tokenizer_path):
     print("start loading generator")
     cur_time = time()
     dtype = "auto"
-    gpu_memory_utilization = 0.9
+    gpu_memory_utilization = 0.95
     model = LLM(
         checkpoint,
         gpu_memory_utilization=gpu_memory_utilization,
-        swap_space=1,
+        swap_space=5,
         tensor_parallel_size=torch.cuda.device_count(),
         trust_remote_code=True,
         dtype=dtype,
@@ -45,7 +41,7 @@ def generate(prompts, repeat_num=1):
         cur_time = time()
         sampling_params = SamplingParams(
             n=1,
-            temperature=0.5,
+            temperature=1, # The article said 1 while the original code is 0.5.
             top_p=1,
             stop=[tokenizer.eos_token, '<|eot_id|>'],
             max_tokens=2048,
@@ -54,9 +50,11 @@ def generate(prompts, repeat_num=1):
         elapsed_time = time() - cur_time
         print("generation elapsed time: {:.2f}min".format(elapsed_time / 60))
         extracted_responses = []
-        for response in responses:
+        for j, response in enumerate(responses):
             for i in range(repeat_num):
                 extracted_responses.append(response.outputs[i].text.strip().rstrip("</s>").strip())
+                if j == 0 and i == 0:
+                    print("first response:\n{}".format(extracted_responses[-1]))
 
         elapsed_time = time() - cur_time
         print("generation elapsed time: {:.2f}min".format(elapsed_time / 60))
@@ -103,7 +101,7 @@ def annotate_steps(args):
         print('length', len(dataset))
         questions = [data['question'] for data in dataset]
     else:
-        path = '/path/to/MATH500.jsonl'
+        path = '/storage/group/renkan/luao/original_datasets/mathQA-datasets/math500/test.jsonl'
         with open(path) as f:
             dataset = [json.loads(line) for line in f]
         questions = [d['problem'] for d in dataset]
@@ -132,12 +130,12 @@ if __name__ == "__main__":
     # import deepspeed
     import os
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer_path", type=str, default="meta-llama/Meta-Llama-3-70B-Instruct")
-    parser.add_argument("--model-path", type=str, default="meta-llama/Meta-Llama-3-70B-Instruct")
-    parser.add_argument("--model-name", type=str, default="Llama-3-70B-Instruct")
-    parser.add_argument("--dataset", type=str, default="math")
-    parser.add_argument("--save-path", type=str, default="/path/to/save.json")
-    parser.add_argument("--repeat-num", type=int, default=128)
+    parser.add_argument("--tokenizer_path", type=str, default="/storage/group/renkan/luao/pretrain/MetaMath-Mistral-7B")
+    parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/MetaMath-Mistral-7B")
+    parser.add_argument("--model-name", type=str, default="MetaMath-Mistral-7B")
+    parser.add_argument("--dataset", type=str, default="math500")
+    parser.add_argument("--save-path", type=str, default="bon_test_set/math500.json")
+    parser.add_argument("--repeat-num", type=int, default=16)
     parser.add_argument("--local_rank", type=int, default=0)
     args = parser.parse_args()
     print(args)

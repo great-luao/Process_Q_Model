@@ -1,0 +1,12 @@
+nobackup/
+
+# pyc file
+*.pyc
+
+# __pycache__ directory
+__pycache__/
+
+# json file
+*.json
+
+wandb/

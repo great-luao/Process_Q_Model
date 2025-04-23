@@ -17,6 +17,7 @@ import torch.nn as nn
 import re
 import math
 import argparse
+import multiprocessing
 
 
 def seed_everything(seed=0):
@@ -28,14 +29,14 @@ def seed_everything(seed=0):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
+LOSS_TYPE = 'rank'
 class PRMTrainer(Trainer):
     def __init__(self, model=None,
                  args=None,
                  data_collator=None,
                  train_dataset=None,
                  eval_dataset=None,
-                 tokenizer=None,
+                 processing_class=None,
                  model_init=None,
                  compute_metrics=None,
                  callbacks=None,
@@ -46,13 +47,13 @@ class PRMTrainer(Trainer):
                          data_collator=data_collator,
                          train_dataset=train_dataset,
                          eval_dataset=eval_dataset,
-                         tokenizer=tokenizer,
+                         processing_class=processing_class,
                          model_init=model_init,
                          compute_metrics=compute_metrics,
                          callbacks=callbacks,
                          optimizers=optimizers,
                          preprocess_logits_for_metrics=preprocess_logits_for_metrics, )
-        self.loss_type = args.loss_type
+        self.loss_type = LOSS_TYPE
         if self.loss_type == 'nce' or self.loss_type == 'orm':
             self.loss_fn = nn.BCELoss(reduction='none')
         elif self.loss_type=='mse':
@@ -78,7 +79,7 @@ class PRMTrainer(Trainer):
         return loss
 
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 
         _,_,rewards = model(input_ids=inputs['input_ids'],attention_mask=inputs['attention_mask'])
 
@@ -105,8 +106,11 @@ class PRMTrainer(Trainer):
 def instruction_format(s):
     return f'[INST] {s} [/INST]'
 
+num_process = multiprocessing.cpu_count() - 1
+
 def generate_dataset(prm_token,tokenizer):
-    ds = load_from_disk(args.dataset_path)['train']
+    # ds = load_from_disk(args.dataset_path)['train']
+    ds = load_dataset("json", data_dir=args.dataset_path, num_proc=12)['train'].select(range(1000)) # for test only
     ds = [d for d in ds]
     queries = []
     longer_queries = []
@@ -153,19 +157,128 @@ def generate_dataset(prm_token,tokenizer):
 
     return queries,longer_queries,longest_queries
 
+def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1024):
+    ds = load_dataset("json", data_dir=args.dataset_path, num_proc=6)['train']
+    # 测试用：仅选择前1000行
+    # ds = ds.select(range(1000))
+
+    def process_example(example, prm_token, tokenizer, max_length, longer_max_length):
+        # 分割输入文本
+        input_text = example['input']
+        steps = re.split(r'Step \d+:', input_text)
+        steps = [s for s in steps if s.strip() != '']
+        
+        # 跳过只有一个步骤的样本
+        if len(steps) <= 1:
+            return None
+        
+        # 提取问题和步骤
+        question = steps[0]
+        steps = [
+            f'Step {i + 1}: ' + step.strip().replace('ки', '').strip()
+            for i, step in enumerate(steps[1:])
+            if step.strip() != ''
+        ]
+        
+        # 处理标签
+        label_steps = re.split(r'Step \d+:', example['label'])
+        label_steps = [s.strip() for s in label_steps[1:] if s.strip() != '']
+        
+        # 验证标签以 '+' 或 '-' 结尾
+        try:
+            for s in label_steps:
+                assert s[-1] in ['+', '-'], f"Invalid label format: {label_steps}"
+        except AssertionError:
+            return None
+        
+        # 提取步骤标签
+        step_labels = [1 if l[-1] == '+' else 0 for l in label_steps]
+        
+        # 验证步骤和标签数量匹配
+        try:
+            assert len(steps) == len(step_labels)
+        except AssertionError:
+            return None
+        
+        # 构造查询
+        query = {
+            "query": instruction_format(question), 
+            "answer": f" {prm_token}\n".join(steps) + f" {prm_token}",
+            "labels": step_labels,
+        }
+        
+        # 计算编码长度
+        encoded = tokenizer.encode(query['query'] + query['answer'])
+        query_length = len(encoded)
+        
+        # 分类：普通、较长、最长
+        if query_length <= max_length:
+            query["length_category"] = "normal"
+        elif max_length < query_length <= longer_max_length:
+            query["length_category"] = "longer"
+        else:
+            query["length_category"] = "longest"
+        
+        return query
+
+    processed_ds = ds.map(
+        process_example,
+        fn_kwargs={
+            "prm_token": prm_token,
+            "tokenizer": tokenizer,
+            "max_length": max_length,
+            "longer_max_length": longer_max_length
+        },
+        batched=False, 
+        num_proc=6,    
+        remove_columns=ds.column_names,
+        desc="Processing dataset"
+    )
+
+    # 过滤掉无效样本（返回 None 的行）
+    processed_ds = processed_ds.filter(lambda x: x is not None, num_proc=num_process)
+
+    # 分割数据集
+    queries = processed_ds.filter(lambda x: x["length_category"] == "normal", num_proc=num_process)
+    longer_queries = processed_ds.filter(lambda x: x["length_category"] == "longer", num_proc=num_process)
+    longest_queries = processed_ds.filter(lambda x: x["length_category"] == "longest", num_proc=num_process)
+
+    # 统计信息
+    statistic = [
+        len(queries),
+        len(longer_queries),
+        len(longest_queries)
+    ]
+
+    # 主进程打印调试信息
+    if accelerator.is_main_process:
+        if len(queries) > 0:
+            print(f"Data Examples:\n{queries[0]}\n{queries[-1]}")
+        print(f"Dataset Lengths: Normal={len(queries)}, Longer={len(longer_queries)}, Longest={len(longest_queries)}")
+        print(f"Statistic: {statistic}")
+
+    # Turn these queries into a list of dictionaries
+    queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in queries]
+    longer_queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in longer_queries]
+    longest_queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in longest_queries]
+
+    return queries, longer_queries, longest_queries
 
 class TrainDataset(Dataset):
     def __init__(self, dataset1, dataset2, dataset3):
-        self.iteration_1 = math.ceil(len(dataset1)/64)
-        self.iteration_2 = math.ceil(len(dataset2)/24)
-        self.iteration_3 = math.ceil(len(dataset3)/8)
+        iter_1_step = 32
+        iter_2_step = 12
+        iter_3_step = 8
+        self.iteration_1 = math.ceil(len(dataset1)/iter_1_step)
+        self.iteration_2 = math.ceil(len(dataset2)/iter_2_step)
+        self.iteration_3 = math.ceil(len(dataset3)/iter_3_step)
         self.dataset = []
         for i in range(self.iteration_3):
-            self.dataset.append(dataset3[i*8:(i + 1) *8])
+            self.dataset.append(dataset3[i*iter_3_step:(i + 1) *iter_3_step])
         for i in range(self.iteration_2):
-            self.dataset.append(dataset2[i*24:(i + 1)*24])
+            self.dataset.append(dataset2[i*iter_2_step:(i + 1)*iter_2_step])
         for i in range(self.iteration_1):  # 更多操作在这里完成
-            self.dataset.append(dataset1[i*64:(i+1)*64])
+            self.dataset.append(dataset1[i*iter_1_step:(i+1)*iter_1_step])
 
     def __getitem__(self,index):
         return self.dataset[index]
@@ -175,31 +288,41 @@ class TrainDataset(Dataset):
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-path", type=str, default="/nobackup/hf-dataset-download/Math-Shepherd")
-    parser.add_argument("--model-path", type=str, default="/nobackup/hf-model/deepseek-math-7b-base")
-    parser.add_argument("--save-path", type=str, default="/nobackup/prm_checkpoints/neg-zeta-16")
+    parser.add_argument("--dataset-path", type=str, default="/storage/group/renkan/luao/reward_datasets/math-shephered/")
+    parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
+    parser.add_argument("--save-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/neg-zeta-16")
     parser.add_argument("--zeta", type=int, default=4)
     parser.add_argument("--loss-type", type=str, default='rank',
                         choices=['rank', 'orm', 'mse', 'bce'])
+    parser.add_argument("--logger", type=str, default='none')
     args = parser.parse_args()
-    print(args)
+    LOSS_TYPE = args.loss_type
 
     seed_everything(0)
     accelerator = Accelerator()
-    prm_token = '[PRM]'
 
+    if accelerator.is_local_main_process:
+        print(args)
+    
+    prm_token = '[PRM]'
     tokenizer = AutoTokenizer.from_pretrained(args.model_path,trust_remote_code=True)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype=torch.bfloat16,use_flash_attention_2=True,trust_remote_code=True)
     tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
     prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
-    dataset1,dataset2,dataset3 = generate_dataset(prm_token, tokenizer)
+    dataset1,dataset2,dataset3 = generate_dataset_2(prm_token, tokenizer)
     dataset = TrainDataset(dataset1,dataset2,dataset3)
+    if accelerator.is_local_main_process:
+        print("Dataset loaded successfully")
+        print(f"Dataset length: {len(dataset)}")
 
+
+    model = AutoModelForCausalLM.from_pretrained(args.model_path,
+                                                 torch_dtype=torch.bfloat16,attn_implementation="flash_attention_2")
     model.resize_token_embeddings(len(tokenizer))
     reward_model = AutoModelForCausalLMWithValueHead(model)
+    if accelerator.is_local_main_process:
+        print("Model loaded successfully")
 
     def data_collator(example, tokenizer=tokenizer):
         inputs = []
@@ -247,6 +370,10 @@ if __name__=='__main__':
         "total_num_steps": 'auto'
     }
 
+    # create dir for save_path
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path, exist_ok=True)
+
     training_args = TrainingArguments(
         output_dir=args.save_path,
         overwrite_output_dir=True,
@@ -258,16 +385,17 @@ if __name__=='__main__':
         # warmup_steps = 150,
         warmup_ratio=0.1,
         gradient_checkpointing=True,
-        num_train_epochs=2,
+        num_train_epochs=1,
         gradient_accumulation_steps=4, #4 for 8 GPUs
         per_device_train_batch_size=1,
-        logging_steps=1,
+        logging_steps=200,
         save_strategy="epoch",
-        report_to="none",
+        # save_strategy="no",
+        report_to=args.logger,
         remove_unused_columns=False,
         bf16=True,
         fp16_backend="auto",
-        disable_tqdm=False,
+        # disable_tqdm=False,
         save_safetensors=False,
         # group_by_length = True,
         deepspeed=deepspeed_config,
@@ -276,7 +404,7 @@ if __name__=='__main__':
 
     trainer = PRMTrainer(
         reward_model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         train_dataset=dataset,
         data_collator=data_collator

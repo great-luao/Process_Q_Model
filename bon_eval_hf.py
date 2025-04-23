@@ -69,12 +69,13 @@ def best_of_n(splitted_completions):
 
 def compute_metrics(dataset_name, scored_results):
     metrics = {}
-    sample_nums = [1, 8, 16, 32, 64, 128]
+    # sample_nums = [1, 8, 16, 32, 64, 128]
+    sample_nums = [1, 8, 16]
 
     if dataset_name == 'gsm8k':
         original_dataset = load_dataset('qintongli/GSM-Plus')['testmini']
     else:
-        path = './MATH500.jsonl'
+        path = '/storage/group/renkan/luao/original_datasets/mathQA-datasets/math500/test.jsonl'
         with open(path) as f:
             original_dataset = [json.loads(line) for line in f]
 
@@ -83,15 +84,14 @@ def compute_metrics(dataset_name, scored_results):
         if not args.baseline and not args.combine:
 
             selected_completions = best_of_n(splitted_completions)
+            print("Length of selected_completions: ", len(selected_completions))
+            print("Length of original_dataset: ", len(original_dataset))
             assert len(original_dataset) == len(selected_completions)
-            if dataset_name == 'math':
-                # acc, _, _ = eval_math_prm([{'response':query['response']} for query in selected_completions],all_problems=[{'solution':data['question']['ground_truth_answer'],'question':data['question']['problem']} for data in original_dataset],is_extract=True)
-                acc, _, _ = eval_math_prm([{'response': query['response']} for query in selected_completions],
-                                          all_problems=[{'solution': data['solution'], 'question': data['problem']} for
-                                                        data in original_dataset], is_extract=False)
-            else:
-                acc, _, _ = eval_gsm8k([{'response': query['response']} for query in selected_completions],
-                                       answers=[data['answer'] for data in original_dataset],is_extract=True)
+            assert dataset_name == 'math'
+            # acc, _, _ = eval_math_prm([{'response':query['response']} for query in selected_completions],all_problems=[{'solution':data['question']['ground_truth_answer'],'question':data['question']['problem']} for data in original_dataset],is_extract=True)
+            acc, _, _ = eval_math_prm([{'response': query['response']} for query in selected_completions],
+                                        all_problems=[{'solution': data['solution'], 'question': data['problem']} for
+                                                    data in original_dataset], is_extract=False)
             metrics[n] = acc
             if accelerator.is_local_main_process:
                 print('*********')
@@ -144,11 +144,13 @@ if __name__=='__main__':
     parser.add_argument("--baseline", type=int, default=0)
     parser.add_argument("--combine", type=int, default=0)
     parser.add_argument("--orm", type=int, default=0)
-    parser.add_argument("--backbone-path", type=str, default="/nobackup2/prm_checkpoints/alldata-zeta-4/checkpoint-532/model.safetensors")
-    parser.add_argument("--model-path", type=str, default="/nobackup2/prm_checkpoints/alldata-zeta-4/checkpoint-532/model.safetensors")
+    parser.add_argument("--backbone-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
+    # parser.add_argument("--backbone-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
+    parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
+    # parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
     parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
     parser.add_argument("--data-file", type=str,required=True)
-    parser.add_argument("--save-file", type=str,default="./prm-data.json")
+    parser.add_argument("--save-file", type=str,default="./bon_result/prm-data.json")
 
     args = parser.parse_args()
     print(args)
@@ -176,10 +178,12 @@ if __name__=='__main__':
         else:
             state_dict = torch.load(args.model_path)
 
+        print('loading model from', args.model_path)
         model.load_state_dict(state_dict)
 
+        print("Init deepspeed engine")
         ds_engine = deepspeed.init_inference(model,
-                                             tensor_parallel={"tp_size": 2},
+                                             tensor_parallel={"tp_size": 4},
                                              dtype=torch.bfloat16)
 
         model = ds_engine.module
@@ -256,7 +260,7 @@ if __name__=='__main__':
         ]
         queries = []
         cur_queries = []
-        path = './MATH500.jsonl'
+        path = '/storage/group/renkan/luao/original_datasets/mathQA-datasets/math500/test.jsonl'
         with open(path) as f:
             origin_dataset = [json.loads(line) for line in f]
         for file_name in file_list:
@@ -270,7 +274,7 @@ if __name__=='__main__':
         assert len(origin_dataset) == len(cur_queries), (len(origin_dataset), len(queries))
         for idx, (data, ori) in enumerate(zip(cur_queries, origin_dataset)):
             assert data['question'] == ori['problem']
-            assert len(data['responses']) % 128==0
+            # assert len(data['responses']) % 128==0
             for response_dict in data['responses']:
                 queries.append({
                     'idx': idx,
@@ -287,10 +291,12 @@ if __name__=='__main__':
             steps = re.split('Step \d+:', data['response'])
             steps = [f'Step {id + 1}: ' + step.strip() for id, step in enumerate(steps) if step.strip()!='']
             data["answer"] = f" {prm_token}\n".join(steps) + f" {prm_token}"
+            if(idx <= 1):
+                print(data['answer'])
 
 
         dataset = Dataset.from_pandas(pd.DataFrame.from_records(queries))
-        dataloader = DataLoader(dataset,batch_size=4,shuffle=False,collate_fn=data_collator)
+        dataloader = DataLoader(dataset,batch_size=32,shuffle=False,collate_fn=data_collator)
 
 
         for inputs in tqdm(dataloader):
@@ -309,7 +315,7 @@ if __name__=='__main__':
 
     with open(args.save_file,'w') as f:
         json.dump(queries,f)
-    # queries = json.load(open('temp.json'))
+    queries = json.load(open(args.save_file))
     compute_metrics(data_name, queries)
 
 
