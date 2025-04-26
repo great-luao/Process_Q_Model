@@ -32,22 +32,22 @@ def ranking_loss(rewards,labels,has_neg):
 # Example usage
 if __name__ == "__main__":
     # B, S = 2, 5
-    # rewards = torch.tensor([[0.6, 0.7, 0.8, 0.9, 1.0]], dtype=torch.float32)
-    # # Create labels with two batches
-    # # The first batch is [1, 1, 0, 0, 0], the second batch is [1, 1, 1, 1, 1]
-    # labels = torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.int)
-    # # Calculate has_neg
-    # has_neg = torch.tensor([0], dtype=torch.int)
+    # labels = torch.tensor([[1, 2, 3, -100, -100], [1, 2, -100, -100, -100]], dtype=torch.float32)
+    # # 创建非 -100 的掩码
+    # result = []
+    # for row in labels:
+    #     valid = row[row != -100]
+    #     result.append(valid[-1].unsqueeze(0))
+    # result = torch.stack(result)
 
-    # loss = ranking_loss(rewards, labels, has_neg)
-    # print("Ranking Loss:", loss.item())
-    labels = torch.tensor([[1, 2, 3, -100, -100], [1, 2, -100, -100, -100]], dtype=torch.float32)
-    # 创建非 -100 的掩码
-    mask = (labels == -100)
-    first_pad_indices = torch.argmax(mask.long(), dim=-1, keepdim=True)
-    # 提取对应值
-    correctness = torch.gather(labels, dim=-1, index=first_pad_indices-1)
-    print(correctness.mean())
+    # print(result)  # tensor([[3], [2]])
+
+    loss_true = torch.tensor([2.0, 2.0, 2.0, 2.0])
+    loss_false = torch.tensor([-2.0, -2.0, -2.0, -2.0])
+    correctness = torch.tensor([1., 0., 1.0, 0.])
+
+    loss_all = torch.where(correctness.bool(), loss_true, loss_false)
+    print(loss_all)
 
 
 # def compute_loss(inputs):

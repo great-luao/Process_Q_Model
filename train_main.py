@@ -84,18 +84,16 @@ class PRMTrainer(Trainer):
         loss = (torch.where(labels == 1, loss, 0).sum(-1) / torch.where(labels == 1, 1, 0).sum(-1)).mean()
         return loss
 
-    def conditional_loss(self, logits, labels, return_outputs=False):
+    def conditional_loss(self, logits, correctness, return_outputs=False):
         log_U = torch.log(1 - logits + 1e-10).sum(dim=1)
         
         loss_true = -torch.log(1 - torch.exp(log_U) + 1e-10)
         loss_false = -log_U
         
-        # The correctness tag should be the last valid label in labels
-        mask = (labels == -100)
-        first_pad_indices = torch.argmax(mask.long(), dim=-1, keepdim=True)
-        # 提取对应值
-        correctness = torch.gather(labels, dim=-1, index=first_pad_indices-1)
         loss_all = torch.where(correctness.bool(), loss_true, loss_false)
+        # print("Loss true:", loss_true, " Loss false:", loss_false)
+        # print("Correctness", correctness[:10])
+        # print("Losses", loss_all[:10])
         loss = loss_all.mean()
 
         # mask_correct = correctness.bool()
@@ -143,7 +141,7 @@ class PRMTrainer(Trainer):
         elif self.loss_type=='con':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
             rewards = rewards.sigmoid()
-            loss = self.conditional_loss(rewards,inputs['step_labels'])
+            loss = self.conditional_loss(rewards,1-inputs['has_neg'])
 
         return loss
 
@@ -334,7 +332,8 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=str, default="/storage/group/renkan/luao/reward_datasets/math-shephered/")
     parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
-    parser.add_argument("--save-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/neg-zeta-16")
+    parser.add_argument("--save-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/con-loss")
+    parser.add_argument("--run-name", type=str, default="Test")
     parser.add_argument("--zeta", type=int, default=4)
     parser.add_argument("--loss-type", type=str, default='rank',
                         choices=['con', 'rank', 'orm', 'mse', 'bce'])
@@ -362,7 +361,8 @@ if __name__=='__main__':
 
 
     model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype=torch.bfloat16,attn_implementation="flash_attention_2")
+                                                 torch_dtype=torch.bfloat16,attn_implementation="flash_attention_2",
+                                                 use_cache=False)
     model.resize_token_embeddings(len(tokenizer))
     reward_model = AutoModelForCausalLMWithValueHead(model)
     if accelerator.is_local_main_process:
@@ -372,6 +372,7 @@ if __name__=='__main__':
         inputs = []
         special_ids = []
         step_labels = []
+        outcome_labels = []
         orm_tokens,orm_labels = [],[]
         has_neg = []
         template = '{query}\n{answer}'
@@ -396,13 +397,14 @@ if __name__=='__main__':
         special_ids = pad_sequence(special_ids, padding_value=0, batch_first=True)
         step_labels = pad_sequence(step_labels, padding_value=-100, batch_first=True)
 
+
         return {
             'input_ids': inputs.int(),
             'attention_mask': attention_mask.int(),
             'special_tokens':special_ids,
             'step_labels':step_labels,
             'orm_tokens':torch.tensor(orm_tokens),
-            'has_neg':torch.tensor(has_neg)
+            'has_neg':torch.tensor(has_neg),
         }
 
 
@@ -432,9 +434,11 @@ if __name__=='__main__':
         num_train_epochs=1,
         gradient_accumulation_steps=4, #4 for 8 GPUs
         per_device_train_batch_size=1,
-        logging_steps=200,
+        logging_steps=10,
         # save_strategy="epoch",
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=0.3,
+        run_name=args.run_name,
         report_to=args.logger,
         remove_unused_columns=False,
         bf16=True,
