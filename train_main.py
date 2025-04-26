@@ -60,8 +60,13 @@ class PRMTrainer(Trainer):
             self.loss_fn = nn.MSELoss(reduction='none')
 
     def ranking_loss(self,rewards,labels,has_neg):
-        pos_rewards_exp = torch.where(labels == 1, (rewards).exp(), 0)
-        neg_rewards_exp = torch.where(labels == 0, (rewards+args.zeta).exp(), 0).flip(dims=[-1])
+        """
+        rewards: 模型在每个token位置预测的值, B*S
+        labels: B*S
+        has_neg: B, 有neg标签就为1, 没有就是0.
+        """
+        pos_rewards_exp = torch.where(labels == 1, (rewards).exp(), 0) # Q_c
+        neg_rewards_exp = torch.where(labels == 0, (rewards+args.zeta).exp(), 0).flip(dims=[-1]) # Q_w,越靠后的错误reward应该越小
         neg_reward_sum = neg_rewards_exp.sum(-1)
 
         pos_rewards_cumsum = torch.cat([torch.zeros(rewards.shape[0], 1, device=rewards.device).exp(), pos_rewards_exp],
@@ -72,10 +77,45 @@ class PRMTrainer(Trainer):
         reward_exp_cur = torch.where(labels == 1, pos_rewards_exp, 1)
         reward_exp_cur = torch.cat([torch.zeros(rewards.shape[0], 1, device=rewards.device).exp(), reward_exp_cur], dim=-1)
 
+        # ?这里是不是多+了一个reward_exp_cur?
         loss = -torch.log(reward_exp_cur / (reward_exp_cur + pos_rewards_cumsum + neg_reward_sum[..., None] + 1e-5))
 
         labels = torch.cat([has_neg[..., None], labels], dim=-1)
         loss = (torch.where(labels == 1, loss, 0).sum(-1) / torch.where(labels == 1, 1, 0).sum(-1)).mean()
+        return loss
+
+    def conditional_loss(self, logits, labels, return_outputs=False):
+        log_U = torch.log(1 - logits + 1e-10).sum(dim=1)
+        
+        loss_true = -torch.log(1 - torch.exp(log_U) + 1e-10)
+        loss_false = -log_U
+        
+        # The correctness tag should be the last valid label in labels
+        mask = (labels == -100)
+        first_pad_indices = torch.argmax(mask.long(), dim=-1, keepdim=True)
+        # 提取对应值
+        correctness = torch.gather(labels, dim=-1, index=first_pad_indices-1)
+        loss_all = torch.where(correctness.bool(), loss_true, loss_false)
+        loss = loss_all.mean()
+
+        # mask_correct = correctness.bool()
+        # mask_incorrect = ~mask_correct
+        # if mask_correct.any(): ## 有些batch里可能全部都 correct 或全部都错误，需先判断避免除0
+        #     loss_true_mean = loss_true[mask_correct].mean().detach()
+        # else:
+        #     loss_true_mean = torch.tensor(0.0, device=loss.device)
+        # if mask_incorrect.any():
+        #     loss_false_mean = loss_false[mask_incorrect].mean().detach()
+        # else:
+        #     loss_false_mean = torch.tensor(0.0, device=loss.device)
+
+        # # AUROC computation
+        # with torch.no_grad():#batch size 太小 计算auroc没有意义
+        #     c_H = 1 - torch.exp(log_U)
+        #     y_true = correctness.cpu().numpy()  # Ground truth labels (0 or 1)
+        #     y_pred = c_H.cpu().numpy()  # Predicted probabilities (success probability)
+        #     auroc = roc_auc_score(y_true, y_pred)  # Compute AUROC score
+
         return loss
 
 
@@ -100,6 +140,10 @@ class PRMTrainer(Trainer):
         elif self.loss_type=='rank':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
             loss = self.ranking_loss(rewards,inputs['step_labels'],inputs['has_neg'])
+        elif self.loss_type=='con':
+            rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
+            rewards = rewards.sigmoid()
+            loss = self.conditional_loss(rewards,inputs['step_labels'])
 
         return loss
 
@@ -266,8 +310,8 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
 
 class TrainDataset(Dataset):
     def __init__(self, dataset1, dataset2, dataset3):
-        iter_1_step = 32
-        iter_2_step = 12
+        iter_1_step = 64
+        iter_2_step = 24
         iter_3_step = 8
         self.iteration_1 = math.ceil(len(dataset1)/iter_1_step)
         self.iteration_2 = math.ceil(len(dataset2)/iter_2_step)
@@ -293,7 +337,7 @@ if __name__=='__main__':
     parser.add_argument("--save-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/neg-zeta-16")
     parser.add_argument("--zeta", type=int, default=4)
     parser.add_argument("--loss-type", type=str, default='rank',
-                        choices=['rank', 'orm', 'mse', 'bce'])
+                        choices=['con', 'rank', 'orm', 'mse', 'bce'])
     parser.add_argument("--logger", type=str, default='none')
     args = parser.parse_args()
     LOSS_TYPE = args.loss_type
@@ -389,8 +433,8 @@ if __name__=='__main__':
         gradient_accumulation_steps=4, #4 for 8 GPUs
         per_device_train_batch_size=1,
         logging_steps=200,
-        save_strategy="epoch",
-        # save_strategy="no",
+        # save_strategy="epoch",
+        save_strategy="no",
         report_to=args.logger,
         remove_unused_columns=False,
         bf16=True,

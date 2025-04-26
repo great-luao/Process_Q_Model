@@ -145,12 +145,11 @@ if __name__=='__main__':
     parser.add_argument("--combine", type=int, default=0)
     parser.add_argument("--orm", type=int, default=0)
     parser.add_argument("--backbone-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
-    # parser.add_argument("--backbone-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
-    parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
-    # parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
+    parser.add_argument("--model-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/neg-zeta-16/checkpoint-1043/pytorch_model.bin")
+    # parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
     parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
     parser.add_argument("--data-file", type=str,required=True)
-    parser.add_argument("--save-file", type=str,default="./bon_result/prm-data.json")
+    parser.add_argument("--save-file", type=str,default="./bon_result/prm-data-selftest.json")
 
     args = parser.parse_args()
     print(args)
@@ -170,20 +169,20 @@ if __name__=='__main__':
         prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
         model.resize_token_embeddings(len(tokenizer))
         model = AutoModelForCausalLMWithValueHead(model)
+        
+        print('loading model weights from', args.model_path)
         if '.safetensor' in args.model_path:
             state_dict = {}
             with safe_open(args.model_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     state_dict[key] = f.get_tensor(key)
         else:
-            state_dict = torch.load(args.model_path)
-
-        print('loading model from', args.model_path)
+            state_dict = torch.load(args.model_path, weights_only=True)
         model.load_state_dict(state_dict)
 
         print("Init deepspeed engine")
         ds_engine = deepspeed.init_inference(model,
-                                             tensor_parallel={"tp_size": 4},
+                                             tensor_parallel={"tp_size": 1},
                                              dtype=torch.bfloat16)
 
         model = ds_engine.module
@@ -296,7 +295,7 @@ if __name__=='__main__':
 
 
         dataset = Dataset.from_pandas(pd.DataFrame.from_records(queries))
-        dataloader = DataLoader(dataset,batch_size=32,shuffle=False,collate_fn=data_collator)
+        dataloader = DataLoader(dataset,batch_size=4,shuffle=False,collate_fn=data_collator)
 
 
         for inputs in tqdm(dataloader):
