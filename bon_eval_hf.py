@@ -74,6 +74,17 @@ def best_of_n_last(splitted_completions):
         selected_completions.append(n_completions_per_query[0])
     return selected_completions
 
+def best_of_n_max(splitted_completions):
+    selected_completions = []
+    for n_completions_per_query in splitted_completions:
+        # sorted the step_reward in n_completsions_per_query from min to max
+        # for completion in n_completions_per_query:
+        #     completion["step_reward"] = sorted(completion["step_reward"])
+        n_completions_per_query = sorted(n_completions_per_query, key=lambda x: max(x["step_reward"]), reverse=True)
+        assert all([max(n_completions_per_query[0]["step_reward"]) >= max(completion["step_reward"]) for completion in n_completions_per_query])
+        selected_completions.append(n_completions_per_query[0])
+    return selected_completions
+
 def compute_metrics(dataset_name, scored_results):
     metrics = {}
     # sample_nums = [1, 8, 16, 32, 64, 128]
@@ -90,7 +101,7 @@ def compute_metrics(dataset_name, scored_results):
         splitted_completions = split_query(scored_results, n, max(sample_nums))
         if not args.baseline and not args.combine:
 
-            selected_completions = best_of_n_last(splitted_completions)
+            selected_completions = best_of_n_max(splitted_completions)
             print("Length of selected_completions: ", len(selected_completions))
             print("Length of original_dataset: ", len(original_dataset))
             assert len(original_dataset) == len(selected_completions)
@@ -165,28 +176,28 @@ if __name__=='__main__':
     accelerator = Accelerator()
     data_name = args.data_name
 
-    # if not args.baseline:
-    #     prm_token = '[PRM]'
-    #     model_path = args.backbone_path
-    #     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    #     if not tokenizer.pad_token:
-    #         tokenizer.pad_token = tokenizer.eos_token
-    #     model = AutoModelForCausalLM.from_pretrained(model_path,
-    #                                                  torch_dtype=torch.bfloat16)
-    #     tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
-    #     prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
-    #     model.resize_token_embeddings(len(tokenizer))
-    #     model = AutoModelForCausalLMWithValueHead(model)
+    if not args.baseline:
+        prm_token = '[PRM]'
+        model_path = args.backbone_path
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        if not tokenizer.pad_token:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(model_path,
+                                                     torch_dtype=torch.bfloat16)
+        tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
+        prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
+        model.resize_token_embeddings(len(tokenizer))
+        model = AutoModelForCausalLMWithValueHead(model)
         
-    #     print('loading model weights from', args.model_path)
-    #     if '.safetensor' in args.model_path:
-    #         state_dict = {}
-    #         with safe_open(args.model_path, framework="pt", device="cpu") as f:
-    #             for key in f.keys():
-    #                 state_dict[key] = f.get_tensor(key)
-    #     else:
-    #         state_dict = torch.load(args.model_path, weights_only=True)
-    #     model.load_state_dict(state_dict)
+        print('loading model weights from', args.model_path)
+        if '.safetensor' in args.model_path:
+            state_dict = {}
+            with safe_open(args.model_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+        else:
+            state_dict = torch.load(args.model_path, weights_only=True)
+        model.load_state_dict(state_dict)
 
     #     print("Init deepspeed engine")
     #     deepspeed_config = json.load(open('accelerate_configs/deepspeed_3.json'))

@@ -148,7 +148,7 @@ class PRMTrainer(Trainer):
 def instruction_format(s):
     return f'[INST] {s} [/INST]'
 
-num_process = multiprocessing.cpu_count() - 1
+num_process = multiprocessing.cpu_count() - 4
 
 def generate_dataset(prm_token,tokenizer):
     # ds = load_from_disk(args.dataset_path)['train']
@@ -309,7 +309,7 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
 class TrainDataset(Dataset):
     def __init__(self, dataset1, dataset2, dataset3):
         iter_1_step = 64
-        iter_2_step = 24
+        iter_2_step = 16
         iter_3_step = 8
         self.iteration_1 = math.ceil(len(dataset1)/iter_1_step)
         self.iteration_2 = math.ceil(len(dataset2)/iter_2_step)
@@ -332,7 +332,7 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=str, default="/storage/group/renkan/luao/reward_datasets/math-shephered/")
     parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
-    parser.add_argument("--save-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/con-loss")
+    parser.add_argument("--save-path", type=str, default="/storage/group/renkan/luao/PQM/orm")
     parser.add_argument("--run-name", type=str, default="Test")
     parser.add_argument("--zeta", type=int, default=4)
     parser.add_argument("--loss-type", type=str, default='rank',
