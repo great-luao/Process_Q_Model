@@ -43,7 +43,13 @@ class ValueHead(nn.Module):
                 if hasattr(config.decoder, "hidden_size"):
                     hidden_size = config.decoder.hidden_size
 
-        self.summary = nn.Linear(hidden_size, 1)
+        self.summary = nn.Sequential(
+            nn.Linear(hidden_size, 1)
+        )
+
+        if config.prob:
+            print("Add a sigmoid head in the value head to get probabilities")
+            self.summary.append(nn.Sigmoid())
 
         self.flatten = nn.Flatten()
 
@@ -112,6 +118,10 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
             raise ValueError("The model does not have a language model head, please use a model that has one.")
 
+        print(kwargs)
+        self.prob = kwargs.get("prob", False)
+        if kwargs['prob']:
+            self.pretrained_model.config.prob = kwargs['prob']
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
         self.is_peft_model = False
         self._init_weights(**v_head_kwargs)

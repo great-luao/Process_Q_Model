@@ -5,9 +5,9 @@ import random
 import math
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
-from datasets import load_dataset, Dataset, load_from_disk
+from datasets import load_dataset, Dataset
 from accelerate import Accelerator
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from value_model import AutoModelForCausalLMWithValueHead
 import torch
 from bon_eval_utils import eval_gsm8k, eval_math_prm
@@ -20,6 +20,7 @@ import deepspeed
 from copy import deepcopy
 from safetensors import safe_open
 from collections import Counter
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 
 def seed_everything(seed=0):
@@ -58,7 +59,7 @@ def split_query(completions, n, N=16): # extract top-n logprob completion for ea
         splitted_completions.append(samples[:n])
     return splitted_completions
 
-def best_of_n(splitted_completions):
+def best_of_n_min(splitted_completions):
     selected_completions = []
     for n_completions_per_query in splitted_completions:
         n_completions_per_query = sorted(n_completions_per_query, key=lambda x: x["reward"], reverse=True)
@@ -101,7 +102,7 @@ def compute_metrics(dataset_name, scored_results):
         splitted_completions = split_query(scored_results, n, max(sample_nums))
         if not args.baseline and not args.combine:
 
-            selected_completions = best_of_n_max(splitted_completions)
+            selected_completions = best_of_n_min(splitted_completions)
             print("Length of selected_completions: ", len(selected_completions))
             print("Length of original_dataset: ", len(original_dataset))
             assert len(original_dataset) == len(selected_completions)
@@ -163,11 +164,11 @@ if __name__=='__main__':
     parser.add_argument("--combine", type=int, default=0)
     parser.add_argument("--orm", type=int, default=0)
     parser.add_argument("--backbone-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
-    parser.add_argument("--model-path", type=str, default="/public/home/luao/LLM/Process_Q_Model/nobackup/prm_checkpoints/con-loss/checkpoint-531/pytorch_model.bin")
+    parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/PQM/orm/checkpoint-596/pytorch_model.bin")
     # parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
     parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
     parser.add_argument("--data-file", type=str,required=True)
-    parser.add_argument("--save-file", type=str,default="./bon_result/con-prm-data-selftest.json")
+    parser.add_argument("--save-file", type=str,default="./bon_result/prm-data-selftest.json")
 
     args = parser.parse_args()
     print(args)
@@ -176,28 +177,28 @@ if __name__=='__main__':
     accelerator = Accelerator()
     data_name = args.data_name
 
-    if not args.baseline:
-        prm_token = '[PRM]'
-        model_path = args.backbone_path
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        if not tokenizer.pad_token:
-            tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(model_path,
-                                                     torch_dtype=torch.bfloat16)
-        tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
-        prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
-        model.resize_token_embeddings(len(tokenizer))
-        model = AutoModelForCausalLMWithValueHead(model)
+    # if not args.baseline:
+    #     prm_token = '[PRM]'
+    #     model_path = args.backbone_path
+    #     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    #     if not tokenizer.pad_token:
+    #         tokenizer.pad_token = tokenizer.eos_token
+    #     model = AutoModelForCausalLM.from_pretrained(model_path,
+    #                                                  torch_dtype=torch.bfloat16)
+    #     tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
+    #     prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
+    #     model.resize_token_embeddings(len(tokenizer))
+    #     model = AutoModelForCausalLMWithValueHead(model)
         
-        print('loading model weights from', args.model_path)
-        if '.safetensor' in args.model_path:
-            state_dict = {}
-            with safe_open(args.model_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    state_dict[key] = f.get_tensor(key)
-        else:
-            state_dict = torch.load(args.model_path, weights_only=True)
-        model.load_state_dict(state_dict)
+    #     print('loading model weights from', args.model_path)
+    #     if '.safetensor' in args.model_path:
+    #         state_dict = {}
+    #         with safe_open(args.model_path, framework="pt", device="cpu") as f:
+    #             for key in f.keys():
+    #                 state_dict[key] = f.get_tensor(key)
+    #     else:
+    #         state_dict = torch.load(args.model_path, weights_only=True)
+    #     model.load_state_dict(state_dict)
 
     #     print("Init deepspeed engine")
     #     deepspeed_config = json.load(open('accelerate_configs/deepspeed_3.json'))
