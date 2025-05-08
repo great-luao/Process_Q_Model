@@ -4,21 +4,26 @@ import json
 import random
 import math
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import IterableDataset,Dataset
-from datasets import load_dataset, load_from_disk
+from torch.utils.data import Dataset
+from datasets import load_dataset
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from value_model import AutoModelForCausalLMWithValueHead
 import torch
-import sys, os
-from tqdm import tqdm
-import torch.nn.functional as F
-import torch.nn as nn
+import os
 import re
-import math
-import argparse
 import multiprocessing
-
+import torch.nn as nn
+import argparse
+from sklearn.metrics import roc_auc_score
+from utils import rm_instruction_format
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from transformers.utils import (
+    is_sagemaker_mp_enabled,
+)
+from transformers.trainer_pt_utils import (
+    nested_detach,
+)
 
 def seed_everything(seed=0):
     random.seed(seed)
@@ -29,7 +34,6 @@ def seed_everything(seed=0):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-LOSS_TYPE = 'rank'
 class PRMTrainer(Trainer):
     def __init__(self, model=None,
                  args=None,
@@ -53,7 +57,7 @@ class PRMTrainer(Trainer):
                          callbacks=callbacks,
                          optimizers=optimizers,
                          preprocess_logits_for_metrics=preprocess_logits_for_metrics, )
-        self.loss_type = LOSS_TYPE
+        self.loss_type = model.config.loss_type
         if self.loss_type == 'nce' or self.loss_type == 'orm':
             self.loss_fn = nn.BCELoss(reduction='none')
         elif self.loss_type=='mse':
@@ -77,7 +81,6 @@ class PRMTrainer(Trainer):
         reward_exp_cur = torch.where(labels == 1, pos_rewards_exp, 1)
         reward_exp_cur = torch.cat([torch.zeros(rewards.shape[0], 1, device=rewards.device).exp(), reward_exp_cur], dim=-1)
 
-        # ?这里是不是多+了一个reward_exp_cur?
         loss = -torch.log(reward_exp_cur / (reward_exp_cur + pos_rewards_cumsum + neg_reward_sum[..., None] + 1e-5))
 
         labels = torch.cat([has_neg[..., None], labels], dim=-1)
@@ -92,30 +95,13 @@ class PRMTrainer(Trainer):
         
         loss_all = torch.where(correctness.bool(), loss_true, loss_false)
         # print("Loss true:", loss_true, " Loss false:", loss_false)
-        # print("Correctness", correctness[:10])
+        # print("Logits shape:", logits.shape)
+        # print("Logits", logits[:1])
+        # print("Correctness", correctness[:32])
         # print("Losses", loss_all[:10])
         loss = loss_all.mean()
 
-        # mask_correct = correctness.bool()
-        # mask_incorrect = ~mask_correct
-        # if mask_correct.any(): ## 有些batch里可能全部都 correct 或全部都错误，需先判断避免除0
-        #     loss_true_mean = loss_true[mask_correct].mean().detach()
-        # else:
-        #     loss_true_mean = torch.tensor(0.0, device=loss.device)
-        # if mask_incorrect.any():
-        #     loss_false_mean = loss_false[mask_incorrect].mean().detach()
-        # else:
-        #     loss_false_mean = torch.tensor(0.0, device=loss.device)
-
-        # # AUROC computation
-        # with torch.no_grad():#batch size 太小 计算auroc没有意义
-        #     c_H = 1 - torch.exp(log_U)
-        #     y_true = correctness.cpu().numpy()  # Ground truth labels (0 or 1)
-        #     y_pred = c_H.cpu().numpy()  # Predicted probabilities (success probability)
-        #     auroc = roc_auc_score(y_true, y_pred)  # Compute AUROC score
-
         return loss
-
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
 
@@ -123,88 +109,152 @@ class PRMTrainer(Trainer):
 
         if self.loss_type=='nce':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
-            rewards = rewards.sigmoid()
+            # rewards = rewards.sigmoid()
             loss = (self.loss_fn(rewards, torch.where(inputs['step_labels']!=-100,inputs['step_labels'],0).bfloat16()) * (inputs['step_labels']!=-100)).sum()/(inputs['step_labels']!=-100).sum()
         elif self.loss_type=='mse':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
-            rewards = rewards.sigmoid()
+            # rewards = rewards.sigmoid()
             loss = (self.loss_fn(rewards,
                                  torch.where(inputs['step_labels'] != -100, inputs['step_labels'], 0).bfloat16()) * (
                                 inputs['step_labels'] != -100)).sum() / (inputs['step_labels'] != -100).sum()
         elif self.loss_type=='orm':
             rewards = rewards.gather(dim=-1, index=inputs['orm_tokens'][...,None])
-            rewards = rewards.sigmoid()
+            # rewards = rewards.sigmoid()
             loss = self.loss_fn(rewards.squeeze(1),1-inputs['has_neg'].bfloat16()).mean()
         elif self.loss_type=='rank':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
             loss = self.ranking_loss(rewards,inputs['step_labels'],inputs['has_neg'])
         elif self.loss_type=='con':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
-            rewards = rewards.sigmoid()
+            # print("Special tokens:", inputs['special_tokens'][:1])
+            # print("Rewards here:", rewards[:1])
+            rewards = torch.where(inputs['special_tokens']!=0,rewards,0).bfloat16()
+            # rewards = rewards.sigmoid() We move the sigmoid to the model
             loss = self.conditional_loss(rewards,1-inputs['has_neg'])
 
+        if return_outputs:
+            return loss, rewards, 1-inputs['has_neg']
+        
         return loss
 
-def instruction_format(s):
-    return f'[INST] {s} [/INST]'
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`List[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        # has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
+        # # For CLIP-like models capable of returning loss values.
+        # # If `return_loss` is not specified or being `None` in `inputs`, we check if the default value of `return_loss`
+        # # is `True` in `model.forward`.
+        # return_loss = inputs.get("return_loss", None)
+        # if return_loss is None:
+        #     return_loss = self.can_return_loss
+        # loss_without_labels = True if len(self.label_names) == 0 and return_loss else False
+
+        inputs = self._prepare_inputs(inputs)
+        if ignore_keys is None:
+            if hasattr(self.model, "config"):
+                ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", ["past_key_values"])
+            else:
+                ignore_keys = []
+
+        with torch.no_grad():
+            if is_sagemaker_mp_enabled():
+                raise NotImplementedError()
+            else:
+                with self.compute_loss_context_manager():
+                    loss, logits, labels = self.compute_loss(model, inputs, return_outputs=True)
+                    # print("Loss after compute_loss:", loss)
+                loss = loss.mean().detach()
+
+        if self.model.config.loss_type != 'con' or prediction_loss_only:
+            return (loss, None, None)
+
+        logits = nested_detach(logits)
+        # print("Logits in prediction step:", logits[:1])
+
+        # print("Labels collected in prediction step:", labels[:10])
+
+        return (loss, logits, labels)
+
+def compute_metrics(eval_preds):
+    probs, correctness = eval_preds
+    
+    probs = np.array(probs)
+    correctness = np.array(correctness)
+
+    print("Start computing metrics-----------")
+
+    # Replace all -100 in probs with 0
+    probs[probs == -100] = 0.
+
+    print("Probs shape:", probs.shape)
+    # print("Probs is",probs[:5])
+
+    # with torch.no_grad():        
+    log_U = np.log(1 - probs + 1e-10)
+    log_U = np.sum(log_U, axis=1)  # (batch_size,)
+    c_H = 1 - np.exp(log_U)
+    
+    loss_true = -np.log(1 - np.exp(log_U) + 1e-10)
+    loss_false = -log_U
+
+    # Replace correctness.bool() with an np function
+    # loss = np.where(correctness.bool(), loss_true, loss_false)
+    loss = np.where(correctness.astype(bool), loss_true, loss_false)
+    bce = loss.mean()
+    
+    # ---- 2) Brier Score ----Brier = mean( (y - p)^2 )
+    brier_mse = ((correctness - c_H)**2).mean()
+
+    # AUROC computation
+    y_true = correctness  # Ground truth labels (0 or 1)
+    y_pred = c_H  # Predicted probabilities (success probability)
+    auroc = roc_auc_score(y_true, y_pred)  # Compute AUROC score
+
+    # print("BCE Loss:", bce.item())
+    # print("Brier MSE:", brier_mse.item())
+    # print("AUROC:", auroc)
+
+    return {
+        "nll": bce.item(),
+        "brier_mse": brier_mse.item(),
+        "auroc": auroc
+    }
 
 num_process = multiprocessing.cpu_count() - 4
 
-def generate_dataset(prm_token,tokenizer):
-    # ds = load_from_disk(args.dataset_path)['train']
-    ds = load_dataset("json", data_dir=args.dataset_path, num_proc=12)['train'].select(range(1000)) # for test only
-    ds = [d for d in ds]
-    queries = []
-    longer_queries = []
-    longest_queries = []
-    statistic = [0,0,0]
-    for d in ds:
-        input_text = d['input']
-        steps = re.split('Step \d+:', input_text)
-        steps = [s for s in steps if s.strip() != '']
-        if len(steps) == 1:
-            continue
-        question = steps[0]
-        steps = [f'Step {i + 1}: ' + step.strip().replace('ки', '').strip() for i, step in enumerate(steps[1:]) if
-                 step.strip() != '']
-        label_steps = re.split('Step \d+:', d['label'])
-        label_steps = [s.strip() for s in label_steps[1:]]
-        try:
-            for s in label_steps:
-                assert s[-1] in ['+', '-'], (label_steps)
-        except:
-            continue
-        step_labels = [1 if l[-1] == '+' else 0 for l in label_steps]
-        try:
-            assert len(steps) == len(step_labels)
-        except:
-            continue
-        queries.append({
-            "query": instruction_format(question),
-            "answer": f" {prm_token}\n".join(steps) + f" {prm_token}",
-            "labels": step_labels,  # + [outcome_label],
-        })
-        ids = tokenizer.encode(queries[-1]['query'] + queries[-1]['answer'])
-        if len(ids) > 512 and len(ids)<=1024:
-            longer_queries.append(queries.pop())
-        elif len(ids) > 1024:
-            longest_queries.append(queries.pop())
-
-        #[392777, 49233, 2543] , len split:512, 1024
-
-    if accelerator.is_local_main_process:
-        print(f'Data Examples:\n{queries[0]}\n{queries[-1]}')
-        print(f'Dataset Length:{len(queries)}')
-        print(statistic)
-
-    return queries,longer_queries,longest_queries
-
-def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1024):
+def generate_dataset(prm_token, tokenizer, max_length=512):
     ds = load_dataset("json", data_dir=args.dataset_path, num_proc=6)['train']
     # 测试用：仅选择前1000行
-    # ds = ds.select(range(1000))
+    # ds = ds.select(range(10000))
 
-    def process_example(example, prm_token, tokenizer, max_length, longer_max_length):
+    def process_example(example, prm_token, tokenizer, max_length):
         # 分割输入文本
         input_text = example['input']
         steps = re.split(r'Step \d+:', input_text)
@@ -244,7 +294,7 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
         
         # 构造查询
         query = {
-            "query": instruction_format(question), 
+            "query": rm_instruction_format(question), 
             "answer": f" {prm_token}\n".join(steps) + f" {prm_token}",
             "labels": step_labels,
         }
@@ -256,10 +306,8 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
         # 分类：普通、较长、最长
         if query_length <= max_length:
             query["length_category"] = "normal"
-        elif max_length < query_length <= longer_max_length:
-            query["length_category"] = "longer"
         else:
-            query["length_category"] = "longest"
+            query["length_category"] = "longer"
         
         return query
 
@@ -269,7 +317,6 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
             "prm_token": prm_token,
             "tokenizer": tokenizer,
             "max_length": max_length,
-            "longer_max_length": longer_max_length
         },
         batched=False, 
         num_proc=6,    
@@ -278,45 +325,52 @@ def generate_dataset_2(prm_token, tokenizer, max_length=512, longer_max_length=1
     )
 
     # 过滤掉无效样本（返回 None 的行）
-    processed_ds = processed_ds.filter(lambda x: x is not None, num_proc=num_process)
+    processed_ds = processed_ds.filter(lambda x: x is not None, num_proc=6)
+
+    # print("Type of processed_ds:", type(processed_ds))
+
+    # dataset = processed_ds.train_test_split(test_size=0.05, seed=args.seed, shuffle=True)
+    # train_dataset = dataset['train']
+    # eval_dataset = dataset['test']
 
     # 分割数据集
-    queries = processed_ds.filter(lambda x: x["length_category"] == "normal", num_proc=num_process)
-    longer_queries = processed_ds.filter(lambda x: x["length_category"] == "longer", num_proc=num_process)
-    longest_queries = processed_ds.filter(lambda x: x["length_category"] == "longest", num_proc=num_process)
-
-    # 统计信息
-    statistic = [
-        len(queries),
-        len(longer_queries),
-        len(longest_queries)
-    ]
-
-    # 主进程打印调试信息
-    if accelerator.is_main_process:
-        if len(queries) > 0:
-            print(f"Data Examples:\n{queries[0]}\n{queries[-1]}")
-        print(f"Dataset Lengths: Normal={len(queries)}, Longer={len(longer_queries)}, Longest={len(longest_queries)}")
-        print(f"Statistic: {statistic}")
+    queries = processed_ds.filter(lambda x: x["length_category"] == "normal", num_proc=6)
+    longer_queries = processed_ds.filter(lambda x: x["length_category"] == "longer", num_proc=6)
 
     # Turn these queries into a list of dictionaries
     queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in queries]
     longer_queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in longer_queries]
-    longest_queries = [{"query": q["query"], "answer": q["answer"], "labels": q["labels"]} for q in longest_queries]
 
-    return queries, longer_queries, longest_queries
+    # 主进程打印调试信息
+    if accelerator.is_main_process:
+        if len(queries) > 0:
+            print(f"Train Data Examples:\n{queries[0]}\n{queries[-1]}")
+        print(f"Train Dataset Lengths: Normal={len(queries)}, Longer={len(longer_queries)}")
+
+    # Randomly split each querie into train and eval
+    from utils import split_queries
+    train_queries, eval_queries = split_queries(queries, test_size=0.005, seed=args.seed)
+    # longer_train_queries, longer_eval_queries = split_queries(longer_queries, test_size=0.01, seed=args.seed)
+
+    train_dataset = TrainDataset(train_queries, longer_queries, args.train_batch_size)
+    # eval_dataset = EvalDataset(eval_queries, args.eval_batch_size)
+    eval_dataset = EvalDataset(eval_queries, args.eval_batch_size)
+
+    # Check if eval dataset has only one kind of label
+    eval_labels = [q['labels'][-1] for q in eval_queries]
+    if len(set(eval_labels)) < 2: # 0, 1
+        print(set(eval_labels))
+        raise ValueError("Eval dataset should have all labels, please check your dataset.")
+
+    return train_dataset, eval_dataset
 
 class TrainDataset(Dataset):
-    def __init__(self, dataset1, dataset2, dataset3):
-        iter_1_step = 64
-        iter_2_step = 16
-        iter_3_step = 8
+    def __init__(self, dataset1, dataset2, batch_size=64):
+        iter_1_step = batch_size
+        iter_2_step = batch_size // 4
         self.iteration_1 = math.ceil(len(dataset1)/iter_1_step)
         self.iteration_2 = math.ceil(len(dataset2)/iter_2_step)
-        self.iteration_3 = math.ceil(len(dataset3)/iter_3_step)
         self.dataset = []
-        for i in range(self.iteration_3):
-            self.dataset.append(dataset3[i*iter_3_step:(i + 1) *iter_3_step])
         for i in range(self.iteration_2):
             self.dataset.append(dataset2[i*iter_2_step:(i + 1)*iter_2_step])
         for i in range(self.iteration_1):  # 更多操作在这里完成
@@ -326,22 +380,39 @@ class TrainDataset(Dataset):
         return self.dataset[index]
 
     def __len__(self):
-        return self.iteration_1+self.iteration_2+self.iteration_3
+        return self.iteration_1+self.iteration_2
+
+# TODO: This doesn't work well with gather_function, batch size will be reset to 1 after gather.
+class EvalDataset(Dataset):
+    def __init__(self, dataset, batch_size=64):
+        self.iteration = math.ceil(len(dataset)/batch_size)
+        self.dataset = []
+        for i in range(self.iteration - self.iteration % 4):
+            self.dataset.append(dataset[i*batch_size:(i+1)*batch_size])
+
+    def __getitem__(self,index):
+        return self.dataset[index]
+
+    def __len__(self):
+        return len(self.dataset)
+
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=str, default="/storage/group/renkan/luao/reward_datasets/math-shephered/")
     parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/deepseek-math-7b-base")
-    parser.add_argument("--save-path", type=str, default="/storage/group/renkan/luao/PQM/orm")
+    # parser.add_argument("--save-path", type=str, default="/storage/group/renkan/luao/PQM/orm")
+    parser.add_argument("--train-batch-size", type=int, default=56)
+    parser.add_argument("--eval-batch-size", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", type=str, default="Test")
     parser.add_argument("--zeta", type=int, default=4)
     parser.add_argument("--loss-type", type=str, default='rank',
                         choices=['con', 'rank', 'orm', 'mse', 'bce'])
     parser.add_argument("--logger", type=str, default='none')
     args = parser.parse_args()
-    LOSS_TYPE = args.loss_type
 
-    seed_everything(0)
+    seed_everything(args.seed)
     accelerator = Accelerator()
 
     if accelerator.is_local_main_process:
@@ -353,20 +424,12 @@ if __name__=='__main__':
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({'additional_special_tokens':[prm_token]})
     prm_token_id = tokenizer.encode(prm_token, add_special_tokens=False)[-1]
-    dataset1,dataset2,dataset3 = generate_dataset_2(prm_token, tokenizer)
-    dataset = TrainDataset(dataset1,dataset2,dataset3)
+    train_dataset, eval_dataset= generate_dataset(prm_token, tokenizer)
+
     if accelerator.is_local_main_process:
         print("Dataset loaded successfully")
-        print(f"Dataset length: {len(dataset)}")
-
-
-    model = AutoModelForCausalLM.from_pretrained(args.model_path,
-                                                 torch_dtype=torch.bfloat16,attn_implementation="flash_attention_2",
-                                                 use_cache=False)
-    model.resize_token_embeddings(len(tokenizer))
-    reward_model = AutoModelForCausalLMWithValueHead(model)
-    if accelerator.is_local_main_process:
-        print("Model loaded successfully")
+        print(f"Dataset length: {len(train_dataset)}")
+        print(f"Eval dataset length: {len(eval_dataset)}")
 
     def data_collator(example, tokenizer=tokenizer):
         inputs = []
@@ -407,26 +470,26 @@ if __name__=='__main__':
             'has_neg':torch.tensor(has_neg),
         }
 
-
     deepspeed_config = json.load(open('accelerate_configs/deepspeed_3.json'))
     deepspeed_config["scheduler"]["params"] = {
         "warmup_min_lr": 0,
         "warmup_max_lr": 'auto',
         "warmup_num_steps": 'auto',
-        "total_num_steps": 'auto'
+        "total_num_steps": 'auto',
     }
 
     # create dir for save_path
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path, exist_ok=True)
+    save_path = "/storage/group/renkan/luao/PQM/" + args.run_name
+    if not os.path.exists(save_path):
+        os.makedirs(save_path, exist_ok=True if args.run_name != 'TEST' else False)
 
     training_args = TrainingArguments(
-        output_dir=args.save_path,
+        output_dir=save_path,
         overwrite_output_dir=True,
 
         optim="adamw_torch",
         learning_rate=1e-6, # 2e-6 for 8 GPUs
-
+        seed=args.seed,
         lr_scheduler_type="cosine",
         # warmup_steps = 150,
         warmup_ratio=0.1,
@@ -434,28 +497,59 @@ if __name__=='__main__':
         num_train_epochs=1,
         gradient_accumulation_steps=4, #4 for 8 GPUs
         per_device_train_batch_size=1,
-        logging_steps=10,
-        # save_strategy="epoch",
-        save_strategy="steps",
+        per_device_eval_batch_size=1,
+        logging_steps=0.01,
+        save_strategy="no" if args.run_name == 'TEST' else "steps",
         save_steps=0.3,
         run_name=args.run_name,
         report_to=args.logger,
         remove_unused_columns=False,
         bf16=True,
         fp16_backend="auto",
-        # disable_tqdm=False,
         save_safetensors=False,
         # group_by_length = True,
         deepspeed=deepspeed_config,
         # sharded_ddp="zero_dp_2",
+
+        eval_strategy="steps",
+        eval_steps=0.001,
+        prediction_loss_only=True if args.loss_type != 'con' else False,
+        # batch_eval_metrics=True,
     )
+
+    ###############
+    # Load Model
+    ###############
+    model = AutoModelForCausalLM.from_pretrained(args.model_path,
+                                                 torch_dtype=torch.bfloat16,attn_implementation="flash_attention_2",
+                                                 use_cache=False)
+    model.resize_token_embeddings(len(tokenizer))
+    reward_model = AutoModelForCausalLMWithValueHead(model, loss_type=args.loss_type)
+    if accelerator.is_local_main_process:
+        print("Model loaded successfully")
 
     trainer = PRMTrainer(
         reward_model,
         processing_class=tokenizer,
         args=training_args,
-        train_dataset=dataset,
-        data_collator=data_collator
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics if args.loss_type == 'con' else None,
     )
 
+    ###############
+    # Training loop
+    ###############
+    if accelerator.is_main_process:
+        print("*** Train ***")
     trainer.train()
+
+    ###############
+    # Evaluation loop
+    ###############
+    metrics = trainer.evaluate()
+    if accelerator.is_main_process:
+        print("Initial Evaluation metrics:")
+        for key, value in metrics.items():
+            print(f"{key}: {value}")

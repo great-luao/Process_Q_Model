@@ -47,7 +47,7 @@ class ValueHead(nn.Module):
             nn.Linear(hidden_size, 1)
         )
 
-        if config.prob:
+        if config.loss_type != "rank":
             print("Add a sigmoid head in the value head to get probabilities")
             self.summary.append(nn.Sigmoid())
 
@@ -58,8 +58,8 @@ class ValueHead(nn.Module):
 
         # For now force upcast in fp32 if needed. Let's keep the
         # output in fp32 for numerical stability.
-        if output.dtype != self.summary.weight.dtype:
-            output = output.to(self.summary.weight.dtype)
+        if output.dtype != self.summary[0].weight.dtype:
+            output = output.to(self.summary[0].weight.dtype)
 
         output = self.summary(output)
         return output
@@ -120,8 +120,8 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
 
         print(kwargs)
         self.prob = kwargs.get("prob", False)
-        if kwargs['prob']:
-            self.pretrained_model.config.prob = kwargs['prob']
+        if kwargs.get("loss_type", None) is not None:
+            self.pretrained_model.config.loss_type = kwargs['loss_type']
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
         self.is_peft_model = False
         self._init_weights(**v_head_kwargs)
@@ -190,8 +190,8 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         lm_logits = base_model_output.logits
         loss = base_model_output.loss
 
-        if last_hidden_state.device != self.v_head.summary.weight.device:
-            last_hidden_state = last_hidden_state.to(self.v_head.summary.weight.device)
+        if last_hidden_state.device != self.v_head.summary[0].weight.device:
+            last_hidden_state = last_hidden_state.to(self.v_head.summary[0].weight.device)
 
         value = self.v_head(last_hidden_state).squeeze(-1)
 
