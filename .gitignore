@@ -10,3 +10,5 @@ __pycache__/
 *.json
 
 wandb/
+
+bon_result/

@@ -219,7 +219,10 @@ if __name__=='__main__':
             print(rewards.device)
         del rewards
 
-    save_file = f"./bon_result/{model_type}/{checkpoint}.json"
+
+
+    save_file = f"./reward_result/{model_type}_{args.data_name}/{checkpoint}.json"
+
     print("Saving the results to", save_file)
     if not os.path.exists(os.path.dirname(save_file)):
         os.makedirs(os.path.dirname(save_file), exist_ok=True)
