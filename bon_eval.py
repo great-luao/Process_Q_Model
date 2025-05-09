@@ -25,24 +25,24 @@ def best_of_n(splitted_completions, type:str):
     selected_completions = []
     if type == 'min':
         for n_completions_per_query in splitted_completions:
-            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: min(x["final_reward"]), reverse=True)
-            assert all([min(n_completions_per_query[0]["final_reward"]) >= min(completion["final_reward"]) for completion in n_completions_per_query])
+            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: min(x["step_reward"]), reverse=True)
+            assert all([min(n_completions_per_query[0]["step_reward"]) >= min(completion["step_reward"]) for completion in n_completions_per_query])
             selected_completions.append(n_completions_per_query[0])
     elif type == 'last':
         for n_completions_per_query in splitted_completions:
-            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: x["final_reward"][-1], reverse=True)
-            assert all([n_completions_per_query[0]["final_reward"][-1] >= completion["final_reward"][-1] for completion in n_completions_per_query])
+            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: x["step_reward"][-1], reverse=True)
+            assert all([n_completions_per_query[0]["step_reward"][-1] >= completion["step_reward"][-1] for completion in n_completions_per_query])
             selected_completions.append(n_completions_per_query[0])
     elif type == 'max':
         for n_completions_per_query in splitted_completions:
-            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: max(x["final_reward"]), reverse=True)
-            assert all([max(n_completions_per_query[0]["final_reward"]) >= max(completion["final_reward"]) for completion in n_completions_per_query])
+            n_completions_per_query = sorted(n_completions_per_query, key=lambda x: max(x["step_reward"]), reverse=True)
+            assert all([max(n_completions_per_query[0]["step_reward"]) >= max(completion["step_reward"]) for completion in n_completions_per_query])
             selected_completions.append(n_completions_per_query[0])
     elif type == 'con':
         for n_completions_per_query in splitted_completions:
-            # TODO: Compute the series probability of the final_reward
+            # TODO: Compute the series probability of the step_reward
             for completion in n_completions_per_query:
-                probs = torch.tensor(completion["final_reward"])
+                probs = torch.tensor(completion["step_reward"])
                 # probs = torch.sigmoid(logits)
                 log_U = torch.log(1 - probs + 1e-10).sum(dim=0)  # (steps)
                 c_H = 1 - torch.exp(log_U)
@@ -70,16 +70,8 @@ def compute_metrics(dataset_name, scored_results):
     for n in sample_nums:
         results = deepcopy(scored_results)
         splitted_completions = split_query(results, n)
-
-        # Get the probability from reward
-        if LOSS_TYPE != 'rank':
-            print("The length of splitted_completions: ", len(splitted_completions))
-            for completion in splitted_completions:
-                for sample in completion:
-                    sample["final_reward"] = torch.sigmoid(torch.tensor(sample["step_reward"])).tolist()
-                    # sample["step_reward"] = [reward + 0.5 for reward in original_reward]
         
-        selected_completions = best_of_n(splitted_completions, type="con")
+        selected_completions = best_of_n(splitted_completions, type="last")
         # print("Length of selected_completions: ", len(selected_completions))
         # print("Length of original_dataset: ", len(original_dataset))
         assert len(original_dataset) == len(selected_completions)

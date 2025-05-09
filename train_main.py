@@ -58,7 +58,7 @@ class PRMTrainer(Trainer):
                          optimizers=optimizers,
                          preprocess_logits_for_metrics=preprocess_logits_for_metrics, )
         self.loss_type = model.config.loss_type
-        if self.loss_type == 'nce' or self.loss_type == 'orm':
+        if self.loss_type == 'bce' or self.loss_type == 'orm':
             self.loss_fn = nn.BCELoss(reduction='none')
         elif self.loss_type=='mse':
             self.loss_fn = nn.MSELoss(reduction='none')
@@ -107,7 +107,7 @@ class PRMTrainer(Trainer):
 
         _,_,rewards = model(input_ids=inputs['input_ids'],attention_mask=inputs['attention_mask'])
 
-        if self.loss_type=='nce':
+        if self.loss_type=='bce':
             rewards = rewards.gather(dim=-1, index=inputs['special_tokens'])
             # rewards = rewards.sigmoid()
             loss = (self.loss_fn(rewards, torch.where(inputs['step_labels']!=-100,inputs['step_labels'],0).bfloat16()) * (inputs['step_labels']!=-100)).sum()/(inputs['step_labels']!=-100).sum()
@@ -208,12 +208,12 @@ def compute_metrics(eval_preds):
     probs = np.array(probs)
     correctness = np.array(correctness)
 
-    print("Start computing metrics-----------")
+    # print("Start computing metrics-----------")
 
     # Replace all -100 in probs with 0
     probs[probs == -100] = 0.
 
-    print("Probs shape:", probs.shape)
+    # print("Probs shape:", probs.shape)
     # print("Probs is",probs[:5])
 
     # with torch.no_grad():        
@@ -512,7 +512,7 @@ if __name__=='__main__':
         # sharded_ddp="zero_dp_2",
 
         eval_strategy="steps",
-        eval_steps=0.001,
+        eval_steps=0.05,
         prediction_loss_only=True if args.loss_type != 'con' else False,
         # batch_eval_metrics=True,
     )

@@ -119,7 +119,6 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             raise ValueError("The model does not have a language model head, please use a model that has one.")
 
         print(kwargs)
-        self.prob = kwargs.get("prob", False)
         if kwargs.get("loss_type", None) is not None:
             self.pretrained_model.config.loss_type = kwargs['loss_type']
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
