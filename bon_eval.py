@@ -10,6 +10,7 @@ from collections import Counter
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 import re
 from copy import deepcopy
+import os
 
 LOSS_TYPE : str = None
 
@@ -43,7 +44,6 @@ def best_of_n(splitted_completions, type:str):
             # TODO: Compute the series probability of the step_reward
             for completion in n_completions_per_query:
                 probs = torch.tensor(completion["step_reward"])
-                # probs = torch.sigmoid(logits)
                 log_U = torch.log(1 - probs + 1e-10).sum(dim=0)  # (steps)
                 c_H = 1 - torch.exp(log_U)
                 completion["reward"] = c_H.item()  # Predicted probabilities (success probability)
@@ -57,8 +57,7 @@ def best_of_n(splitted_completions, type:str):
 
 def compute_metrics(dataset_name, scored_results):
     metrics = {}
-    # sample_nums = [1, 8, 16, 32, 64, 128]
-    sample_nums = [1, 8, 16]
+    sample_nums = [1, 8, 16, 32, 64, 128]
 
     if dataset_name == 'gsm8k':
         original_dataset = load_dataset('qintongli/GSM-Plus')['testmini']
@@ -69,9 +68,9 @@ def compute_metrics(dataset_name, scored_results):
 
     for n in sample_nums:
         results = deepcopy(scored_results)
-        splitted_completions = split_query(results, n)
+        splitted_completions = split_query(results, n, N=max(sample_nums))
         
-        selected_completions = best_of_n(splitted_completions, type="last")
+        selected_completions = best_of_n(splitted_completions, type=args.bon_type)
         # print("Length of selected_completions: ", len(selected_completions))
         # print("Length of original_dataset: ", len(original_dataset))
         assert len(original_dataset) == len(selected_completions)
@@ -123,10 +122,11 @@ def compute_metrics(dataset_name, scored_results):
 if __name__=='__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_rank", type=int, default=0)
+    # parser.add_argument("--local_rank", type=int, default=0)
     # parser.add_argument("--model-path", type=str, default="/storage/group/renkan/luao/pretrain/PQM/zeta-4/model.safetensors")
     parser.add_argument("--data-name", type=str,choices=['math','gsm8k'])
     parser.add_argument("--reward-file", type=str,default="./bon_result/con-prm-data.json")
+    parser.add_argument("--bon-type", type=str,default="last", choices=["last", "min", "max", "con"])
 
     args = parser.parse_args()
     print(args)
@@ -142,5 +142,50 @@ if __name__=='__main__':
         raise ValueError("No valid loss type found in the reward file name.")
     print(f"Using loss type: {LOSS_TYPE}")
 
+    check_point = args.reward_file.split('/')[-1].split('.')[0]
+
     queries = json.load(open(args.reward_file))
-    compute_metrics(args.data_name, queries)
+    results = compute_metrics(args.data_name, queries)
+
+    # For the value in the metrics
+    for k, v in results.items():
+        results[k] = round(v, 3)
+
+    # Save the results to a csv file
+    output_file = f"bon_result/eval_{args.data_name}.csv"
+
+    # 1. 统一把 sample size 列名都转换成字符串
+    sample_cols = [str(k) for k in results.keys()]
+    columns = ["method"] + sample_cols
+
+    # 2. 读取旧表或新建空表
+    if os.path.exists(output_file):
+        df = pd.read_csv(output_file, dtype=str)  # 全都当字符串读进来
+        # 然后把数值列转回 float，method 列保持字符串
+        for c in sample_cols:
+            df[c] = df[c].astype(float)
+    else:
+        df = pd.DataFrame(columns=columns)
+
+    # 3. 生成本次行名
+    test_name = f"{LOSS_TYPE}__{check_point}_{args.bon_type}"
+
+    # 4. 构造新行 dict，key 均为字符串
+    row_dict = {"method": test_name}
+    for k, v in results.items():
+        row_dict[str(k)] = v
+
+    # 5. 插入或更新
+    if test_name in df["method"].values:
+        # 存在则更新
+        for c in sample_cols:
+            df.loc[df["method"] == test_name, c] = row_dict[c]
+    else:
+        # 不存在则追加
+        new_row = pd.DataFrame([row_dict], columns=columns)
+        df = pd.concat([df, new_row], ignore_index=True)
+
+    # 6. 按 columns 顺序写回，不保留行索引
+    df.to_csv(output_file, index=False, columns=columns)
+
+    print(f"[INFO] Results saved to {output_file}")
